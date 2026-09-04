@@ -683,10 +683,10 @@ def _validate_code(code: str) -> list[str]:
                 "Use Part.ArcOfCircle (semicircle) + a closing line instead, "
                 "or use Part.makeSphere() for spheres."
             )
-        # Check for 360 degree revolution — always risky with sketch profiles
-        if re.search(r"\.Angle\s*=\s*360", code):
+        # Only full-circle revolutions with 360 degrees without an arc/BSpline or opening line crash
+        if has_full_circle and not has_arc and re.search(r"\.Angle\s*=\s*360", code):
             warnings.append(
-                "360-degree Revolution detected. Ensure the profile is an OPEN "
+                "360-degree Revolution of a full circle detected. Ensure the profile is an OPEN "
                 "shape (semicircle + straight line along axis), NOT a closed "
                 "circle. If you want a sphere, use Part.makeSphere() instead."
             )

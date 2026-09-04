@@ -109,14 +109,23 @@ class TestValidateCode:
         # ArcOfCircle should NOT trigger the revolution warning
         assert not any("crash" in w.lower() for w in warnings)
 
-    def test_blocks_360_degree_revolution(self):
+    def test_blocks_360_degree_revolution_of_circle(self):
         code = (
+            "circle = Part.Circle()\n"
             "feat = body.newObject('PartDesign::Revolution', 'Rev')\n"
             "feat.Angle = 360\n"
         )
         warnings = _validate_code(code)
         assert any("360" in w for w in warnings)
 
+    def test_allows_360_degree_revolution_of_open_profile(self):
+        code = (
+            "arc = Part.ArcOfCircle(circ, 0, 3.14)\n"
+            "feat = body.newObject('PartDesign::Revolution', 'Rev')\n"
+            "feat.Angle = 360\n"
+        )
+        warnings = _validate_code(code)
+        assert not any("360" in w for w in warnings)
     def test_allows_partial_revolution(self):
         code = (
             "feat = body.newObject('PartDesign::Revolution', 'Rev')\n"
