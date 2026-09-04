@@ -1947,6 +1947,8 @@ def _handle_sweep_sketch(
     spine_name: str,
     subtractive: bool = False,
     body_name: str = "",
+    transition: str = "Transformed",
+    frenet: bool = False,
     label: str = "",
 ) -> ToolResult:
     """Sweep a profile sketch along a spine path (AdditivePipe or SubtractivePipe)."""
@@ -1986,6 +1988,16 @@ def _handle_sweep_sketch(
         feat = body.newObject(type_name, label or default_label)
         feat.Profile = profile
         feat.Spine = spine
+        if hasattr(feat, "Transition") and transition:
+            try:
+                feat.Transition = transition
+            except Exception:
+                pass
+        if hasattr(feat, "Frenet"):
+            try:
+                feat.Frenet = frenet
+            except Exception:
+                pass
         profile.Visibility = False
         spine.Visibility = False
 
@@ -2009,6 +2021,10 @@ SWEEP_SKETCH = ToolDefinition(
                   required=False, default=False),
         ToolParam("body_name", "string", "Explicit body name (use when multiple bodies exist)",
                   required=False, default=""),
+        ToolParam("transition", "string", "Corner transition mode: 'Transformed' (smooth), 'RightCorner', 'RoundCorner'",
+                  required=False, default="Transformed", enum=["Transformed", "RightCorner", "RoundCorner"]),
+        ToolParam("frenet", "boolean", "If true, profile orientation follows the Frenet frame (useful for non-planar curvature)",
+                  required=False, default=False),
         ToolParam("label", "string", "Display label for the sweep feature", required=False, default=""),
     ],
     handler=_handle_sweep_sketch,
