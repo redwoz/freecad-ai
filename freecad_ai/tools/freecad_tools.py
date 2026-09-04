@@ -703,6 +703,34 @@ def _handle_create_sketch(
                         Part.Circle(App.Vector(cx, cy, 0), App.Vector(0, 0, 1), r),
                         start_angle, end_angle))
                     geo_count += 1
+                elif geo_type == "bspline":
+                    poles_raw = geo.get("poles", [])
+                    if poles_raw and len(poles_raw) >= 2:
+                        poles = [App.Vector(p[0], p[1], 0) for p in poles_raw]
+                        degree = int(geo.get("degree", min(3, len(poles) - 1)))
+                        weights = geo.get("weights", None)
+                        periodic = bool(geo.get("periodic", False))
+                        curve = Part.BSplineCurve()
+                        if weights and len(weights) == len(poles):
+                            curve.buildFromPolesMultsKnots(poles, weights=[float(w) for w in weights], degree=degree, periodic=periodic)
+                        else:
+                            curve.buildFromPolesMultsKnots(poles, degree=degree, periodic=periodic)
+                        sketch.addGeometry(curve)
+                        geo_count += 1
+                elif geo_type == "polygon":
+                    points = geo.get("points", [])
+                    if len(points) >= 2:
+                        for i in range(len(points)):
+                            p1 = App.Vector(points[i][0], points[i][1], 0)
+                            p2 = App.Vector(points[(i + 1) % len(points)][0],
+                                            points[(i + 1) % len(points)][1], 0)
+                            sketch.addGeometry(Part.LineSegment(p1, p2))
+                            geo_count += 1
+                        n = len(points)
+                        base = sketch.GeometryCount - n
+                        for i in range(n):
+                            sketch.addConstraint(Sketcher.Constraint(
+                                "Coincident", base + i, 2, base + (i + 1) % n, 1))
                 elif geo_type == "rectangle":
                     # Accept both (x1,y1,x2,y2) and (x,y,width,height) formats
                     # Also accept "length" as alias for "height" (LLMs often confuse these)
@@ -894,7 +922,9 @@ CREATE_SKETCH = ToolDefinition(
                   "line: {x1,y1,x2,y2}, "
                   "rectangle: {x,y,width,height}, "
                   "circle: {cx,cy,radius}, "
-                  "arc: {cx,cy,radius,start_angle,end_angle}.",
+                  "arc: {cx,cy,radius,start_angle,end_angle}, "
+                  "bspline: {poles:[[x,y],...], degree:3, weights:[...], periodic:false}, "
+                  "polygon: {points:[[x,y],...]}.",
                   required=False, items={"type": "object"}),
         ToolParam("constraints", "array",
                   "List of Sketcher constraints. Each has 'type' plus constraint-specific params "
@@ -1330,6 +1360,20 @@ def _handle_edit_sketch(
                         Part.Circle(App.Vector(cx, cy, 0), App.Vector(0, 0, 1), r),
                         start_angle, end_angle))
                     geo_added += 1
+                elif geo_type == "bspline":
+                    poles_raw = geo.get("poles", [])
+                    if poles_raw and len(poles_raw) >= 2:
+                        poles = [App.Vector(p[0], p[1], 0) for p in poles_raw]
+                        degree = int(geo.get("degree", min(3, len(poles) - 1)))
+                        weights = geo.get("weights", None)
+                        periodic = bool(geo.get("periodic", False))
+                        curve = Part.BSplineCurve()
+                        if weights and len(weights) == len(poles):
+                            curve.buildFromPolesMultsKnots(poles, weights=[float(w) for w in weights], degree=degree, periodic=periodic)
+                        else:
+                            curve.buildFromPolesMultsKnots(poles, degree=degree, periodic=periodic)
+                        sketch.addGeometry(curve)
+                        geo_added += 1
                 elif geo_type == "rectangle":
                     rect_w = geo.get("width", None)
                     rect_h = geo.get("height", None) or geo.get("length", None)
