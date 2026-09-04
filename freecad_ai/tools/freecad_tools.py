@@ -5,6 +5,7 @@ Tools are designed to be called by the LLM via structured tool calling.
 """
 
 import os
+import re
 
 from .registry import ToolParam, ToolDefinition, ToolResult
 from ..core.executor import execute_code
@@ -2323,6 +2324,56 @@ def _duplicate_label(base_label, requested):
     return requested or f"{base_label}_Copy"
 
 
+
+# Objects that conventionally act as a single shared source of truth for
+# parametric expressions (e.g. "ONE VarSet owns every dimension"). A
+# recursive copyObject() follows expression dependencies onto these too,
+# silently cloning the shared source alongside the requested object.
+_SHARED_SINGLETON_TYPES = ("App::VarSet", "Spreadsheet::Sheet")
+
+
+def _rebind_expression_refs(obj, old_name, new_name, old_label, new_label):
+    """Repoint any of ``obj``'s bound expressions from ``old_name``/``old_label``
+    to ``new_name``/``new_label`` (both the bare-Name and ``<<Label>>`` forms
+    FreeCAD expressions use to reference another object)."""
+    engine = list(getattr(obj, "ExpressionEngine", []) or [])
+    if not engine:
+        return
+    name_pat = re.compile(r'\b' + re.escape(old_name) + r'\b')
+    label_pat = re.compile(r'<<' + re.escape(old_label) + r'>>')
+    for path, expr in engine:
+        new_expr = label_pat.sub(f"<<{new_label}>>", expr)
+        new_expr = name_pat.sub(new_name, new_expr)
+        if new_expr != expr:
+            try:
+                obj.setExpression(path, new_expr)
+            except Exception:
+                pass
+
+
+def _dedupe_shared_dependencies(doc, new_objs, keep, pre_existing_by_key):
+    """Remove copies of shared singleton objects (VarSet/Spreadsheet) that a
+    recursive copyObject() pulled in alongside ``keep``, re-pointing every
+    expression in ``new_objs`` back to the pre-existing original.
+
+    Returns the labels of the originals that were reused instead of copied.
+    """
+    reused = []
+    for dup in list(new_objs):
+        if dup is keep or dup.TypeId not in _SHARED_SINGLETON_TYPES:
+            continue
+        orig = pre_existing_by_key.get((dup.TypeId, dup.Label))
+        if orig is None or orig is dup:
+            continue
+        for other in new_objs:
+            if other is dup:
+                continue
+            _rebind_expression_refs(other, dup.Name, orig.Name, dup.Label, orig.Label)
+        doc.removeObject(dup.Name)
+        reused.append(orig.Label)
+    return reused
+
+
 def _handle_duplicate_object(
     object_name: str,
     translate_x: float = 0.0,
@@ -2342,6 +2393,9 @@ def _handle_duplicate_object(
             hint = _suggest_similar(doc, object_name)
             return ToolResult(success=False, output="", error=f"Object '{object_name}' not found.{hint}")
 
+        pre_names = {o.Name for o in doc.Objects}
+        pre_by_key = {(o.TypeId, o.Label): o for o in doc.Objects}
+
         result = doc.copyObject(obj, True)
         # copyObject(single_obj, True) returns a plain DocumentObject on FreeCAD
         # 1.1.x; the list/tuple branch is a forward-compat guard. [-1] is chosen
@@ -2352,6 +2406,9 @@ def _handle_duplicate_object(
             return ToolResult(success=False, output="", error=f"Failed to duplicate '{obj.Label}'.")
 
         copy.Label = _duplicate_label(obj.Label, label)
+
+        new_objs = [o for o in doc.Objects if o.Name not in pre_names]
+        reused = _dedupe_shared_dependencies(doc, new_objs, copy, pre_by_key)
 
         if translate_x or translate_y or translate_z or rotate_angle:
             copy.Placement = _apply_relative_placement(
@@ -2368,10 +2425,15 @@ def _handle_duplicate_object(
             return ToolResult(success=False, output="",
                               error=f"Duplicate '{copy.Label}' did not recompute cleanly.")
 
+        output = (f"Duplicated '{obj.Label}' → '{copy.Label}' ({copy.TypeId}); "
+                  "original unchanged.")
+        if reused:
+            output += (f" Reused existing shared source(s) {', '.join(sorted(set(reused)))} "
+                       "instead of duplicating them.")
+
         return ToolResult(
             success=True,
-            output=(f"Duplicated '{obj.Label}' → '{copy.Label}' ({copy.TypeId}); "
-                    "original unchanged."),
+            output=output,
             data={"name": copy.Name, "label": copy.Label},
         )
 
@@ -2387,7 +2449,9 @@ DUPLICATE_OBJECT = ToolDefinition(
         "the copy relative to the original (0 = on top of it). To duplicate a solid, "
         "pass its Body. Note: if the object's placement is driven by an attachment "
         "(e.g. a datum attached to an edge), the offset won't stick — duplicate a "
-        "fixed-placement object (such as a two-point datum line) for a parallel copy."
+        "fixed-placement object (such as a two-point datum line) for a parallel copy. "
+        "If the source's expressions reference a shared VarSet/Spreadsheet, the copy "
+        "keeps referencing the SAME shared source — it is never duplicated."
     ),
     category="modeling",
     parameters=[
@@ -3396,25 +3460,13 @@ LIST_DOCUMENTS = ToolDefinition(
 
 def _handle_switch_document(document_name: str) -> ToolResult:
     """Switch the active document."""
-    import FreeCAD as App
-    from ..core.active_document import sync_app_active_document, refresh_gui_for_document
+    from ..core.active_document import resolve_document_by_name, get_synced_active_document
 
-    docs = App.listDocuments()
-    doc = docs.get(document_name)
-    if not doc:
-        # Try matching by label
-        for d in docs.values():
-            if d.Label == document_name:
-                doc = d
-                break
-    if not doc:
-        available = ", ".join(docs.keys())
-        return ToolResult(success=False, output="",
-                          error=f"Document '{document_name}' not found. Available: {available}")
+    err = resolve_document_by_name(document_name)
+    if err:
+        return ToolResult(success=False, output="", error=err)
 
-    sync_app_active_document(doc)
-    refresh_gui_for_document(doc)
-
+    doc = get_synced_active_document()
     return ToolResult(
         success=True,
         output=f"Switched to document '{doc.Name}' ({len(doc.Objects)} objects).",
@@ -3743,6 +3795,41 @@ def _resolve_relative_value(current, expr: str):
     return expr
 
 
+def _coerce_property_value(current, resolved):
+    """Coerce ``resolved`` to match ``current``'s Python type when it's a
+    string carrying a numeric/boolean literal.
+
+    ``value`` arrives as a string over the wire (the tool's JSON schema
+    declares it ``"string"`` so relative expressions like ``"+10%"`` fit the
+    same slot as absolute values), and ``_resolve_relative_value`` passes an
+    absolute value straight through unchanged. Without this, ``setattr()``
+    on an ``App::PropertyInteger`` (or Float/Bool) raises
+    ``TypeError: type must be int, not str`` — FreeCAD's Python property
+    setters do not coerce strings themselves.
+    """
+    if not isinstance(resolved, str):
+        return resolved
+    text = resolved.strip()
+    if isinstance(current, bool):
+        low = text.lower()
+        if low in ("true", "1", "yes", "on"):
+            return True
+        if low in ("false", "0", "no", "off"):
+            return False
+        return resolved
+    if isinstance(current, int):
+        try:
+            return int(float(text))
+        except ValueError:
+            return resolved
+    if isinstance(current, float):
+        try:
+            return float(text)
+        except ValueError:
+            return resolved
+    return resolved
+
+
 def _handle_modify_property(
     object_name: str,
     property_name: str,
@@ -3762,7 +3849,7 @@ def _handle_modify_property(
             )
 
         current = getattr(obj, property_name)
-        resolved = _resolve_relative_value(current, value)
+        resolved = _coerce_property_value(current, _resolve_relative_value(current, value))
 
         # Report old→new for relative changes
         if resolved != value:

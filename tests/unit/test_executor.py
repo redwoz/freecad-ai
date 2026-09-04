@@ -579,6 +579,56 @@ class TestAutoSave:
         assert doc.saved_paths == []
 
 
+
+class TestSnapshotDocumentForSandbox:
+    """TI-023: the sandbox pre-check must snapshot the LIVE in-memory
+    document via saveAs(), not shutil.copy2 the last on-disk save —
+    otherwise an object created earlier this session (never explicitly
+    saved) is invisible to the sandboxed subprocess and its getObject()
+    intermittently returns None for something that demonstrably exists in
+    the real document.
+    """
+
+    def test_snapshots_live_state_via_saveas(self, tmp_path):
+        original = tmp_path / "part.FCStd"
+        original.write_text("stale-on-disk-content")
+        doc = _FakeDoc(str(original))
+
+        snapshot_path = executor._snapshot_document_for_sandbox(doc)
+
+        assert snapshot_path is not None
+        assert doc.saved_paths == [snapshot_path]
+
+    def test_restores_original_filename_after_snapshot(self, tmp_path):
+        original = tmp_path / "part.FCStd"
+        original.write_text("x")
+        doc = _FakeDoc(str(original))
+
+        executor._snapshot_document_for_sandbox(doc)
+
+        assert doc.FileName == str(original)
+
+    def test_returns_none_for_never_saved_document(self):
+        doc = _FakeDoc("")
+        assert executor._snapshot_document_for_sandbox(doc) is None
+
+    def test_returns_none_when_on_disk_file_missing(self, tmp_path):
+        doc = _FakeDoc(str(tmp_path / "missing.FCStd"))
+        assert executor._snapshot_document_for_sandbox(doc) is None
+
+    def test_does_not_shell_out_to_shutil_copy(self, tmp_path, monkeypatch):
+        # A stale on-disk file must never be the source of the snapshot.
+        original = tmp_path / "part.FCStd"
+        original.write_text("stale")
+        doc = _FakeDoc(str(original))
+
+        def _boom(*a, **kw):
+            raise AssertionError("shutil.copy2 must not be used for the sandbox snapshot")
+        monkeypatch.setattr(executor.shutil, "copy2", _boom)
+
+        executor._snapshot_document_for_sandbox(doc)
+
+
 class TestFindFreecadCmd:
     """Regression tests for console-binary discovery (#58).
 

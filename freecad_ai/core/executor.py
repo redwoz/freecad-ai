@@ -176,6 +176,33 @@ def _collect_object_issues(objects_state, baseline_bad):
     return issues
 
 
+
+def _snapshot_document_for_sandbox(pre_doc):
+    """Write ``pre_doc``'s CURRENT in-memory state to a temp .FCStd for the
+    sandbox subprocess to open.
+
+    Must NOT ``shutil.copy2`` the on-disk file: that only reflects the last
+    explicit save, so any object/property a prior tool call created this
+    session (e.g. ``create_variable_set``) is invisible to the sandbox until
+    the user saves — the sandboxed ``doc.getObject()`` intermittently returns
+    None for an object that demonstrably exists in the real, live document.
+    ``saveAs()`` snapshots live state directly, mirroring the same
+    saveAs-then-restore trick ``_auto_save`` already uses so ``FileName``
+    is never left pointing at the snapshot.
+
+    Returns the snapshot path, or None if ``pre_doc`` was never saved (no
+    ``FileName`` to restore afterward — the caller falls back to a fresh
+    sandbox document).
+    """
+    fn = getattr(pre_doc, "FileName", "") if pre_doc else ""
+    if not fn or not os.path.isfile(fn):
+        return None
+    fd, snapshot_path = tempfile.mkstemp(suffix=".FCStd")
+    os.close(fd)
+    pre_doc.saveAs(snapshot_path)
+    pre_doc.FileName = fn
+    return snapshot_path
+
 def _sandbox_test(code: str, timeout: int = 15, document_path: str | None = None) -> tuple:
     """Test code in a headless FreeCAD subprocess.
 
@@ -475,19 +502,15 @@ def execute_code(code: str, timeout: int | None = None, sandbox: bool = True,
     sandbox_copy_path = None
     if sandbox and not skip_safety:
         pre_doc = get_synced_active_document()
-        fn = getattr(pre_doc, "FileName", "") if pre_doc else ""
-        if fn and os.path.isfile(fn):
-            try:
-                fd, sandbox_copy_path = tempfile.mkstemp(suffix=".FCStd")
-                os.close(fd)
-                shutil.copy2(fn, sandbox_copy_path)
-            except OSError as e:
-                return ExecutionResult(
-                    success=False,
-                    stdout="",
-                    stderr=f"Sandbox: could not copy document for validation: {e}",
-                    code=code,
-                )
+        try:
+            sandbox_copy_path = _snapshot_document_for_sandbox(pre_doc)
+        except Exception as e:
+            return ExecutionResult(
+                success=False,
+                stdout="",
+                stderr=f"Sandbox: could not snapshot document for validation: {e}",
+                code=code,
+            )
         try:
             # The dry-run must get the same budget as the live execution
             # (which arms a SIGALRM for the full `timeout`). Capping it lower
@@ -626,20 +649,16 @@ def validate_code(code: str, timeout: int = 15, skip_safety: bool = False) -> Ex
 
     from .active_document import get_synced_active_document
     pre_doc = get_synced_active_document()
-    fn = getattr(pre_doc, "FileName", "") if pre_doc else ""
     sandbox_copy_path = None
-    if fn and os.path.isfile(fn):
-        try:
-            fd, sandbox_copy_path = tempfile.mkstemp(suffix=".FCStd")
-            os.close(fd)
-            shutil.copy2(fn, sandbox_copy_path)
-        except OSError as e:
-            return ExecutionResult(
-                success=False,
-                stdout="",
-                stderr=f"Sandbox: could not copy document for validation: {e}",
-                code=code,
-            )
+    try:
+        sandbox_copy_path = _snapshot_document_for_sandbox(pre_doc)
+    except Exception as e:
+        return ExecutionResult(
+            success=False,
+            stdout="",
+            stderr=f"Sandbox: could not snapshot document for validation: {e}",
+            code=code,
+        )
     try:
         safe, err = _sandbox_test(code, timeout=timeout, document_path=sandbox_copy_path)
     finally:

@@ -62,6 +62,29 @@ class ToolResult:
     error: str = ""
 
 
+
+# Auto-injected for every tool in ToolRegistry._MUTATING_CATEGORIES that
+# doesn't already declare its own ``document_name`` param — advertises the
+# capability ``ToolRegistry.execute`` implements. Kept outside a ToolParam
+# list so no tool source has to declare or thread it by hand.
+_DOCUMENT_NAME_PARAM = ToolParam(
+    "document_name", "string",
+    "Name or label of the document to target (defaults to the active document)",
+    required=False, default="",
+)
+
+
+def _schema_params(tool: "ToolDefinition") -> list["ToolParam"]:
+    """Parameters to advertise in a schema — ``tool.parameters`` plus the
+    auto-injected ``document_name`` param for mutating tools that don't
+    already declare one."""
+    params = tool.parameters
+    if (tool.category not in ToolRegistry._MUTATING_CATEGORIES
+            or any(p.name == "document_name" for p in params)):
+        return params
+    return params + [_DOCUMENT_NAME_PARAM]
+
+
 class ToolRegistry:
     """Registry of available tools."""
 
@@ -95,6 +118,14 @@ class ToolRegistry:
                 results.append(tool)
         return results
 
+    # Categories whose tools mutate the document via a single ``_with_undo``
+    # transaction. These get an auto-injected optional ``document_name``
+    # param (see ``_schema_params``) so a multi-document session can target
+    # a specific document in one call instead of a separate switch_document
+    # call first, then the mutation, in case App.ActiveDocument desyncs
+    # from the intended target between the two.
+    _MUTATING_CATEGORIES = {"modeling"}
+
     def execute(self, name: str, params: dict) -> ToolResult:
         """Execute a tool by name with the given parameters."""
         tool = self._tools.get(name)
@@ -104,8 +135,19 @@ class ToolRegistry:
             )
         # Ensure params are resolved before execution
         tool.resolve_params()
+
+        call_params = dict(params)
+        has_own_document_param = any(p.name == "document_name" for p in tool.parameters)
+        if tool.category in self._MUTATING_CATEGORIES and not has_own_document_param:
+            doc_name = call_params.pop("document_name", "")
+            if doc_name:
+                from ..core.active_document import resolve_document_by_name
+                err = resolve_document_by_name(doc_name)
+                if err:
+                    return ToolResult(success=False, output="", error=err)
+
         try:
-            return tool.handler(**params)
+            return tool.handler(**call_params)
         except TypeError as e:
             return ToolResult(
                 success=False, output="", error=f"Invalid parameters for {name}: {e}"
@@ -133,7 +175,7 @@ class ToolRegistry:
                 "function": {
                     "name": tool.name,
                     "description": tool.description,
-                    "parameters": _params_to_json_schema(tool.parameters),
+                    "parameters": _params_to_json_schema(_schema_params(tool)),
                 },
             })
         return result
@@ -152,7 +194,7 @@ class ToolRegistry:
             result.append({
                 "name": tool.name,
                 "description": tool.description,
-                "input_schema": _params_to_json_schema(tool.parameters),
+                "input_schema": _params_to_json_schema(_schema_params(tool)),
             })
         return result
 
@@ -170,7 +212,7 @@ class ToolRegistry:
             result.append({
                 "name": t.name,
                 "description": t.description,
-                "inputSchema": _params_to_json_schema(t.parameters),
+                "inputSchema": _params_to_json_schema(_schema_params(t)),
             })
         return result
 

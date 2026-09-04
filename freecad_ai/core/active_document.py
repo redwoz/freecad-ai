@@ -69,3 +69,31 @@ def get_synced_active_document():
     if doc is not None:
         sync_app_active_document(doc)
     return doc
+
+
+def resolve_document_by_name(document_name: str) -> "str | None":
+    """Find a document by internal ``Name`` or ``Label`` and make it active.
+
+    Mirrors ``switch_document``'s own matching so both entry points pick the
+    same target document. Returns ``None`` on success, or an error message
+    (naming the open documents) when nothing matches.
+    """
+    try:
+        import FreeCAD as App
+    except ImportError:
+        return "FreeCAD is not available."
+
+    docs = App.listDocuments()
+    doc = docs.get(document_name)
+    if not doc:
+        for d in docs.values():
+            if d.Label == document_name:
+                doc = d
+                break
+    if not doc:
+        available = ", ".join(docs.keys())
+        return f"Document '{document_name}' not found. Available: {available}"
+
+    sync_app_active_document(doc)
+    refresh_gui_for_document(doc)
+    return None
