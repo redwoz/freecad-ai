@@ -260,7 +260,7 @@ def _modeling_tool(name="mutate", handler=None, own_document_param=False):
 
 
 class TestDocumentNameInterception:
-    """TI-004: mutating (category="modeling") tools accept an optional
+    """Mutating (category="modeling") tools accept an optional
     document_name that resolves/switches the active document before the
     handler runs, replacing the switch_document-then-mutate two-call dance.
     """
@@ -336,7 +336,7 @@ class TestDocumentNameInterception:
 
 
 class TestSchemaParamsInjection:
-    """TI-004: the document_name capability must be advertised in the
+    """The document_name capability must be advertised in the
     emitted schema for mutating tools, without duplicating it for a tool
     that already declares its own (switch_document)."""
 

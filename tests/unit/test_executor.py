@@ -581,7 +581,7 @@ class TestAutoSave:
 
 
 class TestSnapshotDocumentForSandbox:
-    """TI-023: the sandbox pre-check must snapshot the LIVE in-memory
+    """The sandbox pre-check must snapshot the LIVE in-memory
     document via saveAs(), not shutil.copy2 the last on-disk save —
     otherwise an object created earlier this session (never explicitly
     saved) is invisible to the sandboxed subprocess and its getObject()

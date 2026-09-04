@@ -56,7 +56,7 @@ class TestResolveRelativeValue:
 
 
 class TestCoercePropertyValue:
-    """TI-022: setattr() on an App::PropertyInteger (as any App::VarSet
+    """setattr() on an App::PropertyInteger (as any App::VarSet
     integer property is) raises 'type must be int, not str' when the
     resolved value is still the raw wire string — modify_property's
     `value` param is declared "string" in its schema even for absolute

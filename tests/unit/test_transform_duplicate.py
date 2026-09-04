@@ -75,7 +75,7 @@ class _FakeDupDoc:
 
 
 class TestRebindExpressionRefs:
-    """TI-024 support: repointing a copied object's expressions off a
+    """Repointing a copied object's expressions off a
     duplicated shared VarSet, back onto the pre-existing original."""
 
     def test_rebinds_bare_name_reference(self):
@@ -109,7 +109,7 @@ class TestRebindExpressionRefs:
 
 
 class TestDedupeSharedDependencies:
-    """TI-024: doc.copyObject(obj, True) recursively copies expression
+    """doc.copyObject(obj, True) recursively copies expression
     dependencies, silently duplicating a shared App::VarSet the source
     references. The duplicate must be removed and every rebound copy
     re-pointed at the pre-existing original."""
