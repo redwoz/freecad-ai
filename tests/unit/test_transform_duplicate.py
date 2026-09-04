@@ -116,7 +116,10 @@ class TestDedupeSharedDependencies:
 
     def test_removes_duplicate_varset_and_rebinds_dependents(self):
         orig_varset = _FakeObj("VarSet", "VarSet", "App::VarSet")
-        dup_varset = _FakeObj("VarSet001", "VarSet", "App::VarSet")
+        # copyObject() auto-suffixes BOTH Name and Label on a Label
+        # collision with the original — verified live against FreeCAD 1.1.x:
+        # Name="VarSet001", Label="VarSet001", never Label="VarSet".
+        dup_varset = _FakeObj("VarSet001", "VarSet001", "App::VarSet")
         copy_body = _FakeObj("Body001", "Body_Copy", "PartDesign::Body",
                               expression_engine=[(".Length", "VarSet001.Height")])
         doc = _FakeDupDoc()
@@ -127,6 +130,21 @@ class TestDedupeSharedDependencies:
         assert reused == ["VarSet"]
         assert doc.removed == ["VarSet001"]
         assert copy_body.set_calls == [(".Length", "VarSet.Height")]
+
+    def test_matches_when_dup_label_exactly_equals_original(self):
+        # If a caller ever hands back an un-suffixed Label (e.g. a future
+        # FreeCAD version, or a differently-shaped copy path), the direct
+        # key lookup must still succeed without falling through to the
+        # suffix-stripping fallback.
+        orig_varset = _FakeObj("VarSet", "VarSet", "App::VarSet")
+        dup_varset = _FakeObj("VarSet001", "VarSet", "App::VarSet")
+        doc = _FakeDupDoc()
+        pre_by_key = {("App::VarSet", "VarSet"): orig_varset}
+
+        reused = _dedupe_shared_dependencies(doc, [dup_varset], None, pre_by_key)
+
+        assert reused == ["VarSet"]
+        assert doc.removed == ["VarSet001"]
 
     def test_does_not_remove_the_object_being_duplicated(self):
         # Duplicating a VarSet directly must keep the requested copy.

@@ -2331,6 +2331,15 @@ def _duplicate_label(base_label, requested):
 # silently cloning the shared source alongside the requested object.
 _SHARED_SINGLETON_TYPES = ("App::VarSet", "Spreadsheet::Sheet")
 
+# ``copyObject()`` uniquifies a Label collision by appending a numeric
+# suffix to BOTH the copy's internal Name and its user-facing Label (e.g.
+# original "TestVars" -> copy Name="TestVars001", Label="TestVars001", not
+# Label="TestVars" as the copy's un-suffixed Label would read). Matching a
+# duplicate singleton against the pre-existing original therefore can't key
+# on the copy's raw Label alone — strip the appended run of trailing digits
+# and retry.
+_LABEL_SUFFIX_RE = re.compile(r'^(.*?)(\d+)$')
+
 
 def _rebind_expression_refs(obj, old_name, new_name, old_label, new_label):
     """Repoint any of ``obj``'s bound expressions from ``old_name``/``old_label``
@@ -2363,6 +2372,10 @@ def _dedupe_shared_dependencies(doc, new_objs, keep, pre_existing_by_key):
         if dup is keep or dup.TypeId not in _SHARED_SINGLETON_TYPES:
             continue
         orig = pre_existing_by_key.get((dup.TypeId, dup.Label))
+        if orig is None:
+            m = _LABEL_SUFFIX_RE.match(dup.Label)
+            if m:
+                orig = pre_existing_by_key.get((dup.TypeId, m.group(1)))
         if orig is None or orig is dup:
             continue
         for other in new_objs:

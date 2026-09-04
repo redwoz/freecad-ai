@@ -21,6 +21,21 @@ import pytest
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
+def _has_qt_bindings():
+    """True if either PySide6 or PySide2 is importable (matches
+    ``freecad_ai/ui/compat.py``'s own fallback order)."""
+    try:
+        import PySide6  # noqa: F401
+        return True
+    except ImportError:
+        pass
+    try:
+        import PySide2  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 @pytest.fixture
 def initgui(monkeypatch):
     """Exec InitGui.py against stubbed FreeCAD modules; yield its namespace."""
@@ -128,12 +143,16 @@ def test_workbench_activation_syncs_the_mcp_tick(
 
 def test_toggling_keep_dock_pushes_the_new_state(initgui, ticks, tmp_config_dir):
     """Flipping the flag has to update the tick in the same breath."""
+    if not _has_qt_bindings():
+        pytest.skip("PySide6/PySide2 not available")
     from freecad_ai.config import get_config
     cfg = get_config()
     cfg.keep_dock_on_workbench_switch = True
 
-    # True -> False, which takes the create=False branch and so needs no
-    # QApplication to hide a dock that was never built.
+    # True -> False, which takes the create=False branch, so no QApplication
+    # is needed to hide a dock that was never built — but Activated() still
+    # imports freecad_ai.ui.chat_widget (for get_chat_dock) unconditionally,
+    # which needs PySide6/PySide2 to be importable even on this branch.
     initgui["ToggleKeepDockCommand"]().Activated()
 
     assert cfg.keep_dock_on_workbench_switch is False

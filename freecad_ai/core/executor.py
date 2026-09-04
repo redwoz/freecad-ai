@@ -190,13 +190,17 @@ def _snapshot_document_for_sandbox(pre_doc):
     saveAs-then-restore trick ``_auto_save`` already uses so ``FileName``
     is never left pointing at the snapshot.
 
-    Returns the snapshot path, or None if ``pre_doc`` was never saved (no
-    ``FileName`` to restore afterward — the caller falls back to a fresh
-    sandbox document).
+    Works for a document that has NEVER been saved (``FileName == ''``) too
+    — ``saveAs`` only needs the live in-memory document, never the on-disk
+    path, so there is nothing to gate on. ``FileName`` (even an empty one)
+    is restored afterward either way.
+
+    Returns the snapshot path, or None only when there is no live document
+    to snapshot at all (``pre_doc`` is None).
     """
-    fn = getattr(pre_doc, "FileName", "") if pre_doc else ""
-    if not fn or not os.path.isfile(fn):
+    if pre_doc is None:
         return None
+    fn = getattr(pre_doc, "FileName", "") or ""
     fd, snapshot_path = tempfile.mkstemp(suffix=".FCStd")
     os.close(fd)
     pre_doc.saveAs(snapshot_path)
@@ -311,12 +315,28 @@ try:
     # --- user code ---
 {indented_code}
     # --- end user code ---
-    doc.recompute()
+
+    # User code may legitimately close (or otherwise invalidate) ``doc`` —
+    # e.g. App.closeDocument(doc.Name), or opening a different document as
+    # part of a multi-document workflow. A deleted FreeCAD document raises
+    # ReferenceError on ANY attribute access, so recomputing/snapshotting it
+    # would crash this except that has nothing left to validate — that is
+    # not itself evidence the code is unsafe. Probe liveness once via the
+    # same exception the deletion would raise.
+    _doc_alive = False
+    try:
+        _doc_alive = doc.Name in App.listDocuments()
+    except Exception:
+        _doc_alive = False
 
     # Post-execution validation: collect console errors + flag only the shapes
     # this code created or newly broke. Either signal means the code "ran" but
     # broke the model — the case where Python-exception-only checking fails.
     _issues = []
+    if _doc_alive:
+        doc.recompute()
+        _objects_state = [_snap(_obj) for _obj in doc.Objects]
+        _issues.extend(_collect_object_issues(_objects_state, _baseline_bad))
     if _observer_installed:
         # De-dup — C++ logs the same error per failed recompute iteration
         _seen = set()
@@ -324,8 +344,6 @@ try:
             if _e and _e not in _seen:
                 _seen.add(_e)
                 _issues.append("FreeCAD error: " + _e)
-    _objects_state = [_snap(_obj) for _obj in doc.Objects]
-    _issues.extend(_collect_object_issues(_objects_state, _baseline_bad))
 
     if _issues:
         result["error"] = "Post-execution validation found issues:\\n" + "\\n".join(_issues)
@@ -592,15 +610,28 @@ def execute_code(code: str, timeout: int | None = None, sandbox: bool = True,
 
         # Recompute and commit
         _recompute(namespace)
-        if doc:
-            doc.commitTransaction()
         import FreeCAD as App
-        d = App.getDocument(doc_name)
-        if d is None:
-            raise RuntimeError(
-                "Target document is no longer available after execution."
-            )
-        refresh_gui_for_document(d)
+
+        # User code may legitimately close (or otherwise invalidate) the
+        # target document itself — e.g. App.closeDocument(doc.Name) as its
+        # deliberate last step. A deleted document raises ReferenceError on
+        # any attribute access, so committing/refreshing it would turn that
+        # into a false failure; probe liveness first instead.
+        doc_still_open = False
+        if doc:
+            try:
+                doc_still_open = doc.Name in App.listDocuments()
+            except Exception:
+                doc_still_open = False
+
+        if doc_still_open:
+            doc.commitTransaction()
+            d = App.getDocument(doc_name)
+            if d is None:
+                raise RuntimeError(
+                    "Target document is no longer available after execution."
+                )
+            refresh_gui_for_document(d)
     except Exception:
         success = False
         traceback.print_exc(file=captured_err)
