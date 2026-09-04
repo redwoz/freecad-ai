@@ -789,7 +789,6 @@ def _handle_create_sketch(
                     if h_expr:
                         sketch.setExpression(f"Constraints[{h_ci}]", h_expr)
                     geo_count += 4
-
         if constraints:
             for con in constraints:
                 if isinstance(con, str):
@@ -2405,6 +2404,158 @@ DUPLICATE_OBJECT = ToolDefinition(
     handler=_handle_duplicate_object,
 )
 
+
+# ── create_clone ───────────────────────────────────────────
+
+def _handle_create_clone(
+    source_object: str,
+    body_name: str = "",
+    translate_x: float = 0.0,
+    translate_y: float = 0.0,
+    translate_z: float = 0.0,
+    rotate_axis_x: float = 0.0,
+    rotate_axis_y: float = 0.0,
+    rotate_axis_z: float = 1.0,
+    rotate_angle: float = 0.0,
+    label: str = "",
+) -> ToolResult:
+    """Create a parametric PartDesign Clone (FeatureBase) linked to a source object/body."""
+    import FreeCAD as App
+
+    def do(doc):
+        src = _get_object(doc, source_object)
+        if not src:
+            hint = _suggest_similar(doc, source_object)
+            return ToolResult(success=False, output="", error=f"Source object '{source_object}' not found.{hint}")
+
+        target_body = None
+        if body_name:
+            target_body = _get_object(doc, body_name)
+            if not target_body:
+                hint = _suggest_similar(doc, body_name, "Body")
+                return ToolResult(success=False, output="", error=f"Body '{body_name}' not found.{hint}")
+        else:
+            # Create a new body for the clone by default if not specified
+            target_body = doc.addObject("PartDesign::Body", label or f"{src.Label}_Clone_Body")
+
+        clone = target_body.newObject("PartDesign::FeatureBase", label or f"{src.Label}_Clone")
+        clone.BaseFeature = src
+
+        if translate_x or translate_y or translate_z or rotate_angle:
+            clone.Placement = _apply_relative_placement(
+                clone.Placement, translate_x, translate_y, translate_z,
+                rotate_axis_x, rotate_axis_y, rotate_axis_z, rotate_angle)
+
+        doc.recompute()
+
+        state = list(getattr(clone, "State", []) or [])
+        if any(s in ("Invalid", "Error") for s in state):
+            return ToolResult(success=False, output="",
+                              error=f"Clone '{clone.Label}' did not recompute cleanly.")
+
+        return ToolResult(
+            success=True,
+            output=f"Created PartDesign Clone '{clone.Label}' linked to '{src.Label}' in Body '{target_body.Label}'",
+            data={"name": clone.Name, "label": clone.Label, "body": target_body.Name},
+        )
+
+    return _with_undo("Create Clone", do)
+
+
+CREATE_CLONE = ToolDefinition(
+    name="create_clone",
+    description=(
+        "Create a live parametric PartDesign Clone (PartDesign::FeatureBase). "
+        "Unlike duplicate_object (which creates an independent detached copy), "
+        "a Clone stays parametrically linked to the source body/feature — modifying "
+        "the source geometry automatically updates all its clones. "
+        "Optional translate/rotate offset the clone placement relative to origin."
+    ),
+    category="modeling",
+    parameters=[
+        ToolParam("source_object", "string", "Internal name of the source body/object to clone"),
+        ToolParam("body_name", "string", "Target PartDesign Body (if omitted, creates a new Body for the clone)", required=False, default=""),
+        ToolParam("translate_x", "number", "X offset in mm", required=False, default=0.0),
+        ToolParam("translate_y", "number", "Y offset in mm", required=False, default=0.0),
+        ToolParam("translate_z", "number", "Z offset in mm", required=False, default=0.0),
+        ToolParam("rotate_axis_x", "number", "Rotation axis X component", required=False, default=0.0),
+        ToolParam("rotate_axis_y", "number", "Rotation axis Y component", required=False, default=0.0),
+        ToolParam("rotate_axis_z", "number", "Rotation axis Z component", required=False, default=1.0),
+        ToolParam("rotate_angle", "number", "Rotation angle in degrees", required=False, default=0.0),
+        ToolParam("label", "string", "Display label for the clone", required=False, default=""),
+    ],
+    handler=_handle_create_clone,
+)
+
+
+
+# ── create_subshape_binder ─────────────────────────────────
+
+def _handle_create_subshape_binder(
+    support_object: str,
+    body_name: str = "",
+    sub_elements: list | None = None,
+    label: str = "",
+) -> ToolResult:
+    """Create a PartDesign SubShapeBinder to reference external geometry into a Body."""
+    def do(doc):
+        sup = _get_object(doc, support_object)
+        if not sup:
+            hint = _suggest_similar(doc, support_object)
+            return ToolResult(success=False, output="", error=f"Support object '{support_object}' not found.{hint}")
+
+        body = None
+        if body_name:
+            body = _get_object(doc, body_name)
+            if not body:
+                hint = _suggest_similar(doc, body_name, "Body")
+                return ToolResult(success=False, output="", error=f"Body '{body_name}' not found.{hint}")
+        else:
+            # Find active or first PartDesign body
+            for o in doc.Objects:
+                if getattr(o, "TypeId", "") == "PartDesign::Body" and o != sup:
+                    body = o
+                    break
+            if not body:
+                body = doc.addObject("PartDesign::Body", "Body")
+
+        binder = body.newObject("PartDesign::SubShapeBinder", label or f"{sup.Label}_Binder")
+        elements = [str(e) for e in sub_elements] if sub_elements else [""]
+        binder.Support = [(sup, elements)]
+
+        doc.recompute()
+
+        state = list(getattr(binder, "State", []) or [])
+        if any(s in ("Invalid", "Error") for s in state):
+            return ToolResult(success=False, output="",
+                              error=f"SubShapeBinder '{binder.Label}' did not recompute cleanly.")
+
+        return ToolResult(
+            success=True,
+            output=f"Created SubShapeBinder '{binder.Label}' referencing '{sup.Label}' in Body '{body.Label}'",
+            data={"name": binder.Name, "label": binder.Label, "body": body.Name},
+        )
+
+    return _with_undo("Create SubShapeBinder", do)
+
+
+CREATE_SUBSHAPE_BINDER = ToolDefinition(
+    name="create_subshape_binder",
+    description=(
+        "Create a PartDesign SubShapeBinder (PartDesign::SubShapeBinder). "
+        "Allows a PartDesign Body to reference geometry (faces, edges, vertices, or entire shapes) "
+        "from another external Body or Part object without breaking PartDesign scope rules or "
+        "creating cyclic dependencies. Useful for modular assemblies, parting surfaces, and clearance pockets."
+    ),
+    category="modeling",
+    parameters=[
+        ToolParam("support_object", "string", "Internal name of the external object to reference"),
+        ToolParam("body_name", "string", "Target PartDesign Body to house the binder (if omitted, uses the active or first available Body)", required=False, default=""),
+        ToolParam("sub_elements", "array", "Specific sub-elements to bind (e.g. ['Face1', 'Edge3']). If omitted, binds the entire object.", required=False, items={"type": "string"}),
+        ToolParam("label", "string", "Display label for the binder", required=False, default=""),
+    ],
+    handler=_handle_create_subshape_binder,
+)
 
 # ── fillet_edges ────────────────────────────────────────────
 
@@ -5877,6 +6028,8 @@ ALL_TOOLS = [
     PART_JOIN_OPERATION,
     TRANSFORM_OBJECT,
     DUPLICATE_OBJECT,
+    CREATE_CLONE,
+    CREATE_SUBSHAPE_BINDER,
     FILLET_EDGES,
     CHAMFER_EDGES,
     CREATE_INNER_RIDGE,
