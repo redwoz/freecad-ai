@@ -235,13 +235,15 @@ CREATE_PRIMITIVE = ToolDefinition(
 
 def _handle_create_body(
     label: str = "Body",
+    name: str = "",
 ) -> ToolResult:
     """Create a PartDesign Body for parametric modeling."""
     import FreeCAD as App
 
     def do(doc):
-        body = doc.addObject("PartDesign::Body", label)
-        body.Label = label
+        target_label = label if label != "Body" or not name else name
+        body = doc.addObject("PartDesign::Body", target_label)
+        body.Label = target_label
         return ToolResult(
             success=True,
             output=(f"Created PartDesign body '{body.Name}' (label: '{body.Label}')."
@@ -257,7 +259,8 @@ CREATE_BODY = ToolDefinition(
     description="Create a PartDesign Body. Bodies are containers for parametric features (sketches, pads, pockets, fillets, etc). Create a body first, then add sketches to it using body_name parameter.",
     category="modeling",
     parameters=[
-        ToolParam("label", "string", "Display label for the body", required=False, default="Body"),
+        ToolParam("label", "string", "Display label for the body (alias: name)", required=False, default="Body"),
+        ToolParam("name", "string", "Display label for the body (alias for label)", required=False, default=""),
     ],
     handler=_handle_create_body,
 )
@@ -548,8 +551,10 @@ def _handle_create_sketch(
     plane: str = "XY",
     body_name: str = "",
     geometries: list | None = None,
+    geometry: list | None = None,
     constraints: list | None = None,
     label: str = "",
+    name: str = "",
     offset: float = 0.0,
     support: str = "",
     face: str = "",
@@ -561,6 +566,8 @@ def _handle_create_sketch(
 
     def do(doc):
         warnings = []
+        geos = geometries if geometries is not None else geometry
+        sketch_label = label or name or ""
 
         body = None
         if body_name:
@@ -627,6 +634,8 @@ def _handle_create_sketch(
             sketch = doc.addObject("Sketcher::SketchObject", label or "Sketch")
 
         # Apply the attachment. sup_obj is the resolved support object (non-None
+        if sketch_label:
+            sketch.Label = sketch_label
         # whenever the resolver returned a face/plane mode).
         if spec["mode"] == "face":
             sketch.AttachmentSupport = [(sup_obj, spec["sub"])]
@@ -671,8 +680,8 @@ def _handle_create_sketch(
                            + " — attachment did not resolve."))
 
         geo_count = 0
-        if geometries:
-            for geo in geometries:
+        if geos:
+            for geo in geos:
                 # Some LLMs pass geometry items as JSON strings instead of dicts
                 if isinstance(geo, str):
                     try:
@@ -918,7 +927,7 @@ CREATE_SKETCH = ToolDefinition(
                   enum=["XY", "XZ", "YZ"]),
         ToolParam("body_name", "string", "Name of PartDesign body to add sketch to", required=False, default=""),
         ToolParam("geometries", "array",
-                  "List of geometry objects. Each has a 'type' key plus type-specific params: "
+                  "List of geometry objects (alias: geometry). Each has a 'type' key plus type-specific params: "
                   "line: {x1,y1,x2,y2}, "
                   "rectangle: {x,y,width,height}, "
                   "circle: {cx,cy,radius}, "
@@ -926,11 +935,15 @@ CREATE_SKETCH = ToolDefinition(
                   "bspline: {poles:[[x,y],...], degree:3, weights:[...], periodic:false}, "
                   "polygon: {points:[[x,y],...]}.",
                   required=False, items={"type": "object"}),
+        ToolParam("geometry", "array",
+                  "List of geometry objects (alias for geometries).",
+                  required=False, items={"type": "object"}),
         ToolParam("constraints", "array",
                   "List of Sketcher constraints. Each has 'type' plus constraint-specific params "
                   "(e.g. {type:'Distance',object1:'Edge1',value:50}).",
                   required=False, items={"type": "object"}),
-        ToolParam("label", "string", "Display label for the sketch", required=False, default=""),
+        ToolParam("label", "string", "Display label for the sketch (alias: name)", required=False, default=""),
+        ToolParam("name", "string", "Display label for the sketch (alias for label)", required=False, default=""),
         ToolParam("offset", "number", "Offset the sketch along the plane normal (e.g. offset=40 on XY places sketch at z=40)", required=False, default=0.0),
         ToolParam("support", "string",
                   "Object to attach the sketch to: a solid (with `face`) or a "
