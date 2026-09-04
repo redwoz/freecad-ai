@@ -109,14 +109,23 @@ class TestValidateCode:
         # ArcOfCircle should NOT trigger the revolution warning
         assert not any("crash" in w.lower() for w in warnings)
 
-    def test_blocks_360_degree_revolution(self):
+    def test_blocks_360_degree_revolution_of_circle(self):
         code = (
+            "circle = Part.Circle()\n"
             "feat = body.newObject('PartDesign::Revolution', 'Rev')\n"
             "feat.Angle = 360\n"
         )
         warnings = _validate_code(code)
         assert any("360" in w for w in warnings)
 
+    def test_allows_360_degree_revolution_of_open_profile(self):
+        code = (
+            "arc = Part.ArcOfCircle(circ, 0, 3.14)\n"
+            "feat = body.newObject('PartDesign::Revolution', 'Rev')\n"
+            "feat.Angle = 360\n"
+        )
+        warnings = _validate_code(code)
+        assert not any("360" in w for w in warnings)
     def test_allows_partial_revolution(self):
         code = (
             "feat = body.newObject('PartDesign::Revolution', 'Rev')\n"
@@ -570,6 +579,71 @@ class TestAutoSave:
         assert doc.saved_paths == []
 
 
+
+class TestSnapshotDocumentForSandbox:
+    """The sandbox pre-check must snapshot the LIVE in-memory
+    document via saveAs(), not shutil.copy2 the last on-disk save —
+    otherwise an object created earlier this session (never explicitly
+    saved) is invisible to the sandboxed subprocess and its getObject()
+    intermittently returns None for something that demonstrably exists in
+    the real document.
+    """
+
+    def test_snapshots_live_state_via_saveas(self, tmp_path):
+        original = tmp_path / "part.FCStd"
+        original.write_text("stale-on-disk-content")
+        doc = _FakeDoc(str(original))
+
+        snapshot_path = executor._snapshot_document_for_sandbox(doc)
+
+        assert snapshot_path is not None
+        assert doc.saved_paths == [snapshot_path]
+
+    def test_restores_original_filename_after_snapshot(self, tmp_path):
+        original = tmp_path / "part.FCStd"
+        original.write_text("x")
+        doc = _FakeDoc(str(original))
+
+        executor._snapshot_document_for_sandbox(doc)
+
+        assert doc.FileName == str(original)
+
+    def test_snapshots_never_saved_document(self):
+        # A never-saved document (empty FileName) still has live in-memory
+        # state that saveAs() can snapshot directly — nothing to gate on.
+        doc = _FakeDoc("")
+        snapshot_path = executor._snapshot_document_for_sandbox(doc)
+        assert snapshot_path is not None
+        assert doc.saved_paths == [snapshot_path]
+
+    def test_restores_empty_filename_for_never_saved_document(self):
+        doc = _FakeDoc("")
+        executor._snapshot_document_for_sandbox(doc)
+        assert doc.FileName == ""
+
+    def test_snapshots_even_when_on_disk_file_missing(self, tmp_path):
+        # saveAs() only needs the live in-memory document, never the
+        # on-disk path, so a stale/missing on-disk file is irrelevant.
+        doc = _FakeDoc(str(tmp_path / "missing.FCStd"))
+        snapshot_path = executor._snapshot_document_for_sandbox(doc)
+        assert snapshot_path is not None
+
+    def test_returns_none_when_pre_doc_is_none(self):
+        assert executor._snapshot_document_for_sandbox(None) is None
+
+    def test_does_not_shell_out_to_shutil_copy(self, tmp_path, monkeypatch):
+        # A stale on-disk file must never be the source of the snapshot.
+        original = tmp_path / "part.FCStd"
+        original.write_text("stale")
+        doc = _FakeDoc(str(original))
+
+        def _boom(*a, **kw):
+            raise AssertionError("shutil.copy2 must not be used for the sandbox snapshot")
+        monkeypatch.setattr(executor.shutil, "copy2", _boom)
+
+        executor._snapshot_document_for_sandbox(doc)
+
+
 class TestFindFreecadCmd:
     """Regression tests for console-binary discovery (#58).
 
@@ -682,3 +756,120 @@ class TestSandboxGuiStub:
         # `import FreeCADGui` is the exact statement that segfaults.
         src = self._generated_script()
         assert "import FreeCADGui" not in src
+
+
+class TestSandboxSurvivesDocumentClose:
+    """Regression: user code that closes the active document (e.g.
+    ``App.closeDocument(doc.Name)``) must not crash the sandbox's post-code
+    validation — a deleted FreeCAD document raises ReferenceError on any
+    attribute access, so blindly calling ``doc.recompute()``/snapshotting
+    ``doc.Objects`` afterward turns legitimate code into a false failure.
+    """
+
+    def _generated_script(self):
+        return TestSandboxGuiStub._generated_script(self)
+
+    def test_harness_probes_document_liveness_before_recompute(self):
+        src = self._generated_script()
+        assert "_doc_alive" in src
+        assert "doc.Name in App.listDocuments()" in src
+
+    def test_harness_guards_recompute_on_liveness(self):
+        src = self._generated_script()
+        # doc.recompute() must be conditioned on _doc_alive, not called
+        # unconditionally right after user code.
+        idx = src.index("# --- end user code ---")
+        tail = src[idx:]
+        recompute_idx = tail.index("doc.recompute()")
+        guard_idx = tail.index("if _doc_alive:")
+        assert guard_idx < recompute_idx, \
+            "doc.recompute() must be inside the `if _doc_alive:` branch"
+
+    def test_generated_harness_is_syntactically_valid(self):
+        # The .format() template must still compile — a missing/misplaced
+        # brace here fails silently at runtime inside the subprocess only.
+        src = self._generated_script()
+        compile(src, "<harness>", "exec")
+
+
+
+class TestExecuteCodeSurvivesDocumentClose:
+    """The real (non-sandboxed) execution path must not turn a document the
+    user's own code closed into a false failure — mirrors
+    TestSandboxSurvivesDocumentClose for the pass-2 execution path."""
+
+    class _FakeExecDoc:
+        def __init__(self, name):
+            self._name = name
+            self.deleted = False
+            self.calls = []
+
+        @property
+        def Name(self):
+            if self.deleted:
+                raise ReferenceError("Cannot access attribute 'Name' of deleted object")
+            return self._name
+
+        def openTransaction(self, label):
+            self.calls.append(("open", label))
+
+        def commitTransaction(self):
+            if self.deleted:
+                raise ReferenceError("Cannot access attribute 'commitTransaction' of deleted object")
+            self.calls.append(("commit",))
+
+        def abortTransaction(self):
+            self.calls.append(("abort",))
+
+        def recompute(self):
+            if self.deleted:
+                raise ReferenceError("Cannot access attribute 'recompute' of deleted object")
+            self.calls.append(("recompute",))
+
+    def _fake_app_module(self, doc):
+        app = MagicMock()
+        app.listDocuments.side_effect = lambda: {} if doc.deleted else {doc._name: doc}
+
+        def _close(name):
+            doc.deleted = True
+        app.closeDocument.side_effect = _close
+        app.getDocument.side_effect = lambda name: None if doc.deleted else doc
+        return app
+
+    def test_code_that_closes_the_document_succeeds(self):
+        from freecad_ai.core import executor
+
+        doc = self._FakeExecDoc("TestDoc")
+        fake_app = self._fake_app_module(doc)
+
+        with patch.dict(sys.modules, {"FreeCAD": fake_app}), \
+                patch("freecad_ai.core.active_document.get_synced_active_document", return_value=doc), \
+                patch.object(executor, "_build_namespace", return_value={"App": fake_app}), \
+                patch.object(executor, "_auto_save"), \
+                patch.object(executor, "_recompute"):
+            result = executor.execute_code(
+                "App.closeDocument('TestDoc')",
+                skip_safety=True,
+            )
+
+        assert result.success is True, result.stderr
+        assert doc.deleted is True
+        assert ("commit",) not in doc.calls
+
+    def test_normal_execution_still_commits_when_document_stays_open(self):
+        from freecad_ai.core import executor
+
+        doc = self._FakeExecDoc("TestDoc")
+        fake_app = self._fake_app_module(doc)
+
+        with patch.dict(sys.modules, {"FreeCAD": fake_app}), \
+                patch("freecad_ai.core.active_document.get_synced_active_document", return_value=doc), \
+                patch("freecad_ai.core.active_document.refresh_gui_for_document") as refresh, \
+                patch.object(executor, "_build_namespace", return_value={"App": fake_app}), \
+                patch.object(executor, "_auto_save"), \
+                patch.object(executor, "_recompute"):
+            result = executor.execute_code("pass", skip_safety=True)
+
+        assert result.success is True, result.stderr
+        assert ("commit",) in doc.calls
+        refresh.assert_called_once()

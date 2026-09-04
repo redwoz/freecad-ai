@@ -2,12 +2,15 @@
 
 import pytest
 
+from unittest.mock import patch
+
 from freecad_ai.tools.registry import (
     ToolDefinition,
     ToolParam,
     ToolRegistry,
     ToolResult,
     _params_to_json_schema,
+    _schema_params,
 )
 
 
@@ -241,3 +244,121 @@ class TestBuiltinToolSchemas:
             "Array-typed properties without 'items' (rejected by strict "
             f"providers like GitHub Models): {offenders}"
         )
+
+
+def _modeling_tool(name="mutate", handler=None, own_document_param=False):
+    params = [ToolParam("x", "number", "A number")]
+    if own_document_param:
+        params.append(ToolParam("document_name", "string", "own param"))
+    return ToolDefinition(
+        name=name,
+        description="Mutates something",
+        parameters=params,
+        handler=handler or (lambda **kw: ToolResult(success=True, output="ok", data=kw)),
+        category="modeling",
+    )
+
+
+class TestDocumentNameInterception:
+    """Mutating (category="modeling") tools accept an optional
+    document_name that resolves/switches the active document before the
+    handler runs, replacing the switch_document-then-mutate two-call dance.
+    """
+
+    def test_document_name_resolved_before_handler(self):
+        reg = ToolRegistry()
+        reg.register(_modeling_tool())
+        with patch(
+            "freecad_ai.core.active_document.resolve_document_by_name",
+            return_value=None,
+        ) as mock_resolve:
+            result = reg.execute("mutate", {"x": 1, "document_name": "Other"})
+        mock_resolve.assert_called_once_with("Other")
+        assert result.success is True
+        assert "document_name" not in result.data  # stripped before the handler call
+
+    def test_document_name_error_short_circuits_handler(self):
+        called = []
+
+        def handler(**kw):
+            called.append(kw)
+            return ToolResult(success=True, output="ok")
+
+        reg = ToolRegistry()
+        reg.register(_modeling_tool(handler=handler))
+        with patch(
+            "freecad_ai.core.active_document.resolve_document_by_name",
+            return_value="Document 'Other' not found. Available: Doc1",
+        ):
+            result = reg.execute("mutate", {"x": 1, "document_name": "Other"})
+        assert result.success is False
+        assert "not found" in result.error
+        assert called == []  # handler never ran
+
+    def test_no_document_name_skips_resolution(self):
+        reg = ToolRegistry()
+        reg.register(_modeling_tool())
+        with patch(
+            "freecad_ai.core.active_document.resolve_document_by_name",
+        ) as mock_resolve:
+            result = reg.execute("mutate", {"x": 1})
+        mock_resolve.assert_not_called()
+        assert result.success is True
+
+    def test_own_document_param_not_intercepted(self):
+        # A tool that already declares document_name (switch_document) keeps
+        # its own semantics — the registry must not pop or resolve for it.
+        captured = {}
+
+        def handler(**kw):
+            captured.update(kw)
+            return ToolResult(success=True, output="ok")
+
+        reg = ToolRegistry()
+        reg.register(_modeling_tool(handler=handler, own_document_param=True))
+        with patch(
+            "freecad_ai.core.active_document.resolve_document_by_name",
+        ) as mock_resolve:
+            reg.execute("mutate", {"x": 1, "document_name": "Explicit"})
+        mock_resolve.assert_not_called()
+        assert captured["document_name"] == "Explicit"
+
+    def test_non_modeling_tool_unaffected(self):
+        reg = ToolRegistry()
+        reg.register(_make_tool("query_tool"))  # category="general"
+        with patch(
+            "freecad_ai.core.active_document.resolve_document_by_name",
+        ) as mock_resolve:
+            result = reg.execute("query_tool", {"x": 1, "document_name": "Whatever"})
+        mock_resolve.assert_not_called()
+        assert result.success is True
+        assert result.data["document_name"] == "Whatever"
+
+
+class TestSchemaParamsInjection:
+    """The document_name capability must be advertised in the
+    emitted schema for mutating tools, without duplicating it for a tool
+    that already declares its own (switch_document)."""
+
+    def test_modeling_tool_gets_document_name_param(self):
+        tool = _modeling_tool()
+        names = [p.name for p in _schema_params(tool)]
+        assert names == ["x", "document_name"]
+
+    def test_non_modeling_tool_unaffected(self):
+        tool = _make_tool("query_tool")  # category="general"
+        names = [p.name for p in _schema_params(tool)]
+        assert names == ["x"]
+
+    def test_own_document_name_param_not_duplicated(self):
+        tool = _modeling_tool(own_document_param=True)
+        names = [p.name for p in _schema_params(tool)]
+        assert names.count("document_name") == 1
+
+    def test_injected_param_is_optional_in_schema(self):
+        tool = ToolDefinition(
+            name="mutate", description="d", parameters=[],
+            handler=lambda **kw: None, category="modeling",
+        )
+        schema = _params_to_json_schema(_schema_params(tool))
+        assert "document_name" not in schema.get("required", [])

@@ -5,6 +5,7 @@ Tools are designed to be called by the LLM via structured tool calling.
 """
 
 import os
+import re
 
 from .registry import ToolParam, ToolDefinition, ToolResult
 from ..core.executor import execute_code
@@ -235,13 +236,15 @@ CREATE_PRIMITIVE = ToolDefinition(
 
 def _handle_create_body(
     label: str = "Body",
+    name: str = "",
 ) -> ToolResult:
     """Create a PartDesign Body for parametric modeling."""
     import FreeCAD as App
 
     def do(doc):
-        body = doc.addObject("PartDesign::Body", label)
-        body.Label = label
+        target_label = label if label != "Body" or not name else name
+        body = doc.addObject("PartDesign::Body", target_label)
+        body.Label = target_label
         return ToolResult(
             success=True,
             output=(f"Created PartDesign body '{body.Name}' (label: '{body.Label}')."
@@ -257,7 +260,8 @@ CREATE_BODY = ToolDefinition(
     description="Create a PartDesign Body. Bodies are containers for parametric features (sketches, pads, pockets, fillets, etc). Create a body first, then add sketches to it using body_name parameter.",
     category="modeling",
     parameters=[
-        ToolParam("label", "string", "Display label for the body", required=False, default="Body"),
+        ToolParam("label", "string", "Display label for the body (alias: name)", required=False, default="Body"),
+        ToolParam("name", "string", "Display label for the body (alias for label)", required=False, default=""),
     ],
     handler=_handle_create_body,
 )
@@ -548,8 +552,10 @@ def _handle_create_sketch(
     plane: str = "XY",
     body_name: str = "",
     geometries: list | None = None,
+    geometry: list | None = None,
     constraints: list | None = None,
     label: str = "",
+    name: str = "",
     offset: float = 0.0,
     support: str = "",
     face: str = "",
@@ -561,6 +567,8 @@ def _handle_create_sketch(
 
     def do(doc):
         warnings = []
+        geos = geometries if geometries is not None else geometry
+        sketch_label = label or name or ""
 
         body = None
         if body_name:
@@ -627,6 +635,8 @@ def _handle_create_sketch(
             sketch = doc.addObject("Sketcher::SketchObject", label or "Sketch")
 
         # Apply the attachment. sup_obj is the resolved support object (non-None
+        if sketch_label:
+            sketch.Label = sketch_label
         # whenever the resolver returned a face/plane mode).
         if spec["mode"] == "face":
             sketch.AttachmentSupport = [(sup_obj, spec["sub"])]
@@ -671,8 +681,8 @@ def _handle_create_sketch(
                            + " — attachment did not resolve."))
 
         geo_count = 0
-        if geometries:
-            for geo in geometries:
+        if geos:
+            for geo in geos:
                 # Some LLMs pass geometry items as JSON strings instead of dicts
                 if isinstance(geo, str):
                     try:
@@ -703,6 +713,34 @@ def _handle_create_sketch(
                         Part.Circle(App.Vector(cx, cy, 0), App.Vector(0, 0, 1), r),
                         start_angle, end_angle))
                     geo_count += 1
+                elif geo_type == "bspline":
+                    poles_raw = geo.get("poles", [])
+                    if poles_raw and len(poles_raw) >= 2:
+                        poles = [App.Vector(p[0], p[1], 0) for p in poles_raw]
+                        degree = int(geo.get("degree", min(3, len(poles) - 1)))
+                        weights = geo.get("weights", None)
+                        periodic = bool(geo.get("periodic", False))
+                        curve = Part.BSplineCurve()
+                        if weights and len(weights) == len(poles):
+                            curve.buildFromPolesMultsKnots(poles, weights=[float(w) for w in weights], degree=degree, periodic=periodic)
+                        else:
+                            curve.buildFromPolesMultsKnots(poles, degree=degree, periodic=periodic)
+                        sketch.addGeometry(curve)
+                        geo_count += 1
+                elif geo_type == "polygon":
+                    points = geo.get("points", [])
+                    if len(points) >= 2:
+                        for i in range(len(points)):
+                            p1 = App.Vector(points[i][0], points[i][1], 0)
+                            p2 = App.Vector(points[(i + 1) % len(points)][0],
+                                            points[(i + 1) % len(points)][1], 0)
+                            sketch.addGeometry(Part.LineSegment(p1, p2))
+                            geo_count += 1
+                        n = len(points)
+                        base = sketch.GeometryCount - n
+                        for i in range(n):
+                            sketch.addConstraint(Sketcher.Constraint(
+                                "Coincident", base + i, 2, base + (i + 1) % n, 1))
                 elif geo_type == "rectangle":
                     # Accept both (x1,y1,x2,y2) and (x,y,width,height) formats
                     # Also accept "length" as alias for "height" (LLMs often confuse these)
@@ -752,7 +790,6 @@ def _handle_create_sketch(
                     if h_expr:
                         sketch.setExpression(f"Constraints[{h_ci}]", h_expr)
                     geo_count += 4
-
         if constraints:
             for con in constraints:
                 if isinstance(con, str):
@@ -890,17 +927,23 @@ CREATE_SKETCH = ToolDefinition(
                   enum=["XY", "XZ", "YZ"]),
         ToolParam("body_name", "string", "Name of PartDesign body to add sketch to", required=False, default=""),
         ToolParam("geometries", "array",
-                  "List of geometry objects. Each has a 'type' key plus type-specific params: "
+                  "List of geometry objects (alias: geometry). Each has a 'type' key plus type-specific params: "
                   "line: {x1,y1,x2,y2}, "
                   "rectangle: {x,y,width,height}, "
                   "circle: {cx,cy,radius}, "
-                  "arc: {cx,cy,radius,start_angle,end_angle}.",
+                  "arc: {cx,cy,radius,start_angle,end_angle}, "
+                  "bspline: {poles:[[x,y],...], degree:3, weights:[...], periodic:false}, "
+                  "polygon: {points:[[x,y],...]}.",
+                  required=False, items={"type": "object"}),
+        ToolParam("geometry", "array",
+                  "List of geometry objects (alias for geometries).",
                   required=False, items={"type": "object"}),
         ToolParam("constraints", "array",
                   "List of Sketcher constraints. Each has 'type' plus constraint-specific params "
                   "(e.g. {type:'Distance',object1:'Edge1',value:50}).",
                   required=False, items={"type": "object"}),
-        ToolParam("label", "string", "Display label for the sketch", required=False, default=""),
+        ToolParam("label", "string", "Display label for the sketch (alias: name)", required=False, default=""),
+        ToolParam("name", "string", "Display label for the sketch (alias for label)", required=False, default=""),
         ToolParam("offset", "number", "Offset the sketch along the plane normal (e.g. offset=40 on XY places sketch at z=40)", required=False, default=0.0),
         ToolParam("support", "string",
                   "Object to attach the sketch to: a solid (with `face`) or a "
@@ -1330,6 +1373,20 @@ def _handle_edit_sketch(
                         Part.Circle(App.Vector(cx, cy, 0), App.Vector(0, 0, 1), r),
                         start_angle, end_angle))
                     geo_added += 1
+                elif geo_type == "bspline":
+                    poles_raw = geo.get("poles", [])
+                    if poles_raw and len(poles_raw) >= 2:
+                        poles = [App.Vector(p[0], p[1], 0) for p in poles_raw]
+                        degree = int(geo.get("degree", min(3, len(poles) - 1)))
+                        weights = geo.get("weights", None)
+                        periodic = bool(geo.get("periodic", False))
+                        curve = Part.BSplineCurve()
+                        if weights and len(weights) == len(poles):
+                            curve.buildFromPolesMultsKnots(poles, weights=[float(w) for w in weights], degree=degree, periodic=periodic)
+                        else:
+                            curve.buildFromPolesMultsKnots(poles, degree=degree, periodic=periodic)
+                        sketch.addGeometry(curve)
+                        geo_added += 1
                 elif geo_type == "rectangle":
                     rect_w = geo.get("width", None)
                     rect_h = geo.get("height", None) or geo.get("length", None)
@@ -1890,6 +1947,8 @@ def _handle_sweep_sketch(
     spine_name: str,
     subtractive: bool = False,
     body_name: str = "",
+    transition: str = "Transformed",
+    frenet: bool = False,
     label: str = "",
 ) -> ToolResult:
     """Sweep a profile sketch along a spine path (AdditivePipe or SubtractivePipe)."""
@@ -1929,6 +1988,16 @@ def _handle_sweep_sketch(
         feat = body.newObject(type_name, label or default_label)
         feat.Profile = profile
         feat.Spine = spine
+        if hasattr(feat, "Transition") and transition:
+            try:
+                feat.Transition = transition
+            except Exception:
+                pass
+        if hasattr(feat, "Frenet"):
+            try:
+                feat.Frenet = frenet
+            except Exception:
+                pass
         profile.Visibility = False
         spine.Visibility = False
 
@@ -1952,6 +2021,10 @@ SWEEP_SKETCH = ToolDefinition(
                   required=False, default=False),
         ToolParam("body_name", "string", "Explicit body name (use when multiple bodies exist)",
                   required=False, default=""),
+        ToolParam("transition", "string", "Corner transition mode: 'Transformed' (smooth), 'RightCorner', 'RoundCorner'",
+                  required=False, default="Transformed", enum=["Transformed", "RightCorner", "RoundCorner"]),
+        ToolParam("frenet", "boolean", "If true, profile orientation follows the Frenet frame (useful for non-planar curvature)",
+                  required=False, default=False),
         ToolParam("label", "string", "Display label for the sweep feature", required=False, default=""),
     ],
     handler=_handle_sweep_sketch,
@@ -2049,6 +2122,104 @@ BOOLEAN_OPERATION = ToolDefinition(
         ToolParam("label", "string", "Display label for the result", required=False, default=""),
     ],
     handler=_handle_boolean_operation,
+)
+
+
+# ── part_join_operation ─────────────────────────────────────
+
+def _handle_part_join_operation(
+    operation: str,
+    base_object: str,
+    tool_objects: list | None = None,
+    label: str = "",
+) -> ToolResult:
+    """Perform an advanced OpenCASCADE BOP join operation (Connect, Slice, Embed)."""
+    def do(doc):
+        base = _get_object(doc, base_object)
+        if not base:
+            hint = _suggest_similar(doc, base_object)
+            return ToolResult(success=False, output="", error=f"Base object '{base_object}' not found.{hint}")
+
+        tools = []
+        if tool_objects:
+            for t_name in tool_objects:
+                t_obj = _get_object(doc, str(t_name))
+                if not t_obj:
+                    hint = _suggest_similar(doc, str(t_name))
+                    return ToolResult(success=False, output="", error=f"Tool object '{t_name}' not found.{hint}")
+                tools.append(t_obj)
+
+        op = operation.lower()
+        if op not in ("connect", "slice", "embed"):
+            return ToolResult(
+                success=False, output="",
+                error=f"Unknown join operation: {operation}. Use: connect, slice, embed",
+            )
+
+        try:
+            import BOPTools.JoinFeatures
+            import BOPTools.SplitFeatures
+        except ImportError:
+            return ToolResult(success=False, output="", error="BOPTools module not available in FreeCAD environment.")
+
+        name = label or f"{operation.capitalize()}_{base.Label}"
+        result_obj = None
+
+        if op == "connect":
+            # Connect: joins intersecting objects without internal walls
+            all_objs = [base] + tools
+            result_obj = BOPTools.JoinFeatures.makeConnect(name=name)
+            result_obj.Objects = all_objs
+        elif op == "slice":
+            # Slice: splits base object using tool sheets/solids
+            if not tools:
+                return ToolResult(success=False, output="", error="Slice operation requires at least one tool object in 'tool_objects'.")
+            result_obj = BOPTools.SplitFeatures.makeSlice(name=name)
+            result_obj.Base = base
+            result_obj.Tools = tools
+            result_obj.Mode = "Split"
+        elif op == "embed":
+            # Embed: embeds tool solid into base solid
+            if not tools:
+                return ToolResult(success=False, output="", error="Embed operation requires exactly one tool object in 'tool_objects'.")
+            result_obj = BOPTools.JoinFeatures.makeEmbed(name=name)
+            result_obj.Base = base
+            result_obj.Tool = tools[0]
+
+        doc.recompute()
+
+        state = list(getattr(result_obj, "State", []) or [])
+        if any(s in ("Invalid", "Error") for s in state):
+            return ToolResult(success=False, output="",
+                              error=f"Part join operation '{operation}' did not recompute cleanly.")
+
+        return ToolResult(
+            success=True,
+            output=f"Performed Part join '{operation}' creating '{result_obj.Label}' ({result_obj.TypeId})",
+            data={"name": result_obj.Name, "label": result_obj.Label, "type_id": result_obj.TypeId},
+        )
+
+    return _with_undo(f"Part Join {operation}", do)
+
+
+PART_JOIN_OPERATION = ToolDefinition(
+    name="part_join_operation",
+    description=(
+        "Advanced OpenCASCADE Part Join and Split operations (Connect, Slice, Embed). "
+        "• 'connect': joins intersecting solids/shells into a single connected volume, removing internal intersecting walls (unlike fuse which can leave inner voids). "
+        "• 'slice': cuts a base solid with tool surfaces/sheets into partitioned solid components. "
+        "• 'embed': embeds a tool solid into a base solid, maintaining boundary surfaces. "
+        "Note: These operate on Part level geometry. For pure parametric PartDesign models, prefer standard subtractive/additive features."
+    ),
+    category="modeling",
+    parameters=[
+        ToolParam("operation", "string", "Join operation type", enum=["connect", "slice", "embed"]),
+        ToolParam("base_object", "string", "Internal name of the base object (or first object for connect)"),
+        ToolParam("tool_objects", "array", "Internal names of tool objects (cutting tools for slice, embedded tool for embed, additional objects for connect)",
+                  required=False, items={"type": "string"}),
+        ToolParam("label", "string", "Display label for the result", required=False, default=""),
+    ],
+    handler=_handle_part_join_operation,
 )
 
 
@@ -2153,6 +2324,69 @@ def _duplicate_label(base_label, requested):
     return requested or f"{base_label}_Copy"
 
 
+
+# Objects that conventionally act as a single shared source of truth for
+# parametric expressions (e.g. "ONE VarSet owns every dimension"). A
+# recursive copyObject() follows expression dependencies onto these too,
+# silently cloning the shared source alongside the requested object.
+_SHARED_SINGLETON_TYPES = ("App::VarSet", "Spreadsheet::Sheet")
+
+# ``copyObject()`` uniquifies a Label collision by appending a numeric
+# suffix to BOTH the copy's internal Name and its user-facing Label (e.g.
+# original "TestVars" -> copy Name="TestVars001", Label="TestVars001", not
+# Label="TestVars" as the copy's un-suffixed Label would read). Matching a
+# duplicate singleton against the pre-existing original therefore can't key
+# on the copy's raw Label alone — strip the appended run of trailing digits
+# and retry.
+_LABEL_SUFFIX_RE = re.compile(r'^(.*?)(\d+)$')
+
+
+def _rebind_expression_refs(obj, old_name, new_name, old_label, new_label):
+    """Repoint any of ``obj``'s bound expressions from ``old_name``/``old_label``
+    to ``new_name``/``new_label`` (both the bare-Name and ``<<Label>>`` forms
+    FreeCAD expressions use to reference another object)."""
+    engine = list(getattr(obj, "ExpressionEngine", []) or [])
+    if not engine:
+        return
+    name_pat = re.compile(r'\b' + re.escape(old_name) + r'\b')
+    label_pat = re.compile(r'<<' + re.escape(old_label) + r'>>')
+    for path, expr in engine:
+        new_expr = label_pat.sub(f"<<{new_label}>>", expr)
+        new_expr = name_pat.sub(new_name, new_expr)
+        if new_expr != expr:
+            try:
+                obj.setExpression(path, new_expr)
+            except Exception:
+                pass
+
+
+def _dedupe_shared_dependencies(doc, new_objs, keep, pre_existing_by_key):
+    """Remove copies of shared singleton objects (VarSet/Spreadsheet) that a
+    recursive copyObject() pulled in alongside ``keep``, re-pointing every
+    expression in ``new_objs`` back to the pre-existing original.
+
+    Returns the labels of the originals that were reused instead of copied.
+    """
+    reused = []
+    for dup in list(new_objs):
+        if dup is keep or dup.TypeId not in _SHARED_SINGLETON_TYPES:
+            continue
+        orig = pre_existing_by_key.get((dup.TypeId, dup.Label))
+        if orig is None:
+            m = _LABEL_SUFFIX_RE.match(dup.Label)
+            if m:
+                orig = pre_existing_by_key.get((dup.TypeId, m.group(1)))
+        if orig is None or orig is dup:
+            continue
+        for other in new_objs:
+            if other is dup:
+                continue
+            _rebind_expression_refs(other, dup.Name, orig.Name, dup.Label, orig.Label)
+        doc.removeObject(dup.Name)
+        reused.append(orig.Label)
+    return reused
+
+
 def _handle_duplicate_object(
     object_name: str,
     translate_x: float = 0.0,
@@ -2172,6 +2406,9 @@ def _handle_duplicate_object(
             hint = _suggest_similar(doc, object_name)
             return ToolResult(success=False, output="", error=f"Object '{object_name}' not found.{hint}")
 
+        pre_names = {o.Name for o in doc.Objects}
+        pre_by_key = {(o.TypeId, o.Label): o for o in doc.Objects}
+
         result = doc.copyObject(obj, True)
         # copyObject(single_obj, True) returns a plain DocumentObject on FreeCAD
         # 1.1.x; the list/tuple branch is a forward-compat guard. [-1] is chosen
@@ -2182,6 +2419,9 @@ def _handle_duplicate_object(
             return ToolResult(success=False, output="", error=f"Failed to duplicate '{obj.Label}'.")
 
         copy.Label = _duplicate_label(obj.Label, label)
+
+        new_objs = [o for o in doc.Objects if o.Name not in pre_names]
+        reused = _dedupe_shared_dependencies(doc, new_objs, copy, pre_by_key)
 
         if translate_x or translate_y or translate_z or rotate_angle:
             copy.Placement = _apply_relative_placement(
@@ -2198,10 +2438,15 @@ def _handle_duplicate_object(
             return ToolResult(success=False, output="",
                               error=f"Duplicate '{copy.Label}' did not recompute cleanly.")
 
+        output = (f"Duplicated '{obj.Label}' → '{copy.Label}' ({copy.TypeId}); "
+                  "original unchanged.")
+        if reused:
+            output += (f" Reused existing shared source(s) {', '.join(sorted(set(reused)))} "
+                       "instead of duplicating them.")
+
         return ToolResult(
             success=True,
-            output=(f"Duplicated '{obj.Label}' → '{copy.Label}' ({copy.TypeId}); "
-                    "original unchanged."),
+            output=output,
             data={"name": copy.Name, "label": copy.Label},
         )
 
@@ -2217,7 +2462,9 @@ DUPLICATE_OBJECT = ToolDefinition(
         "the copy relative to the original (0 = on top of it). To duplicate a solid, "
         "pass its Body. Note: if the object's placement is driven by an attachment "
         "(e.g. a datum attached to an edge), the offset won't stick — duplicate a "
-        "fixed-placement object (such as a two-point datum line) for a parallel copy."
+        "fixed-placement object (such as a two-point datum line) for a parallel copy. "
+        "If the source's expressions reference a shared VarSet/Spreadsheet, the copy "
+        "keeps referencing the SAME shared source — it is never duplicated."
     ),
     category="modeling",
     parameters=[
@@ -2234,6 +2481,158 @@ DUPLICATE_OBJECT = ToolDefinition(
     handler=_handle_duplicate_object,
 )
 
+
+# ── create_clone ───────────────────────────────────────────
+
+def _handle_create_clone(
+    source_object: str,
+    body_name: str = "",
+    translate_x: float = 0.0,
+    translate_y: float = 0.0,
+    translate_z: float = 0.0,
+    rotate_axis_x: float = 0.0,
+    rotate_axis_y: float = 0.0,
+    rotate_axis_z: float = 1.0,
+    rotate_angle: float = 0.0,
+    label: str = "",
+) -> ToolResult:
+    """Create a parametric PartDesign Clone (FeatureBase) linked to a source object/body."""
+    import FreeCAD as App
+
+    def do(doc):
+        src = _get_object(doc, source_object)
+        if not src:
+            hint = _suggest_similar(doc, source_object)
+            return ToolResult(success=False, output="", error=f"Source object '{source_object}' not found.{hint}")
+
+        target_body = None
+        if body_name:
+            target_body = _get_object(doc, body_name)
+            if not target_body:
+                hint = _suggest_similar(doc, body_name, "Body")
+                return ToolResult(success=False, output="", error=f"Body '{body_name}' not found.{hint}")
+        else:
+            # Create a new body for the clone by default if not specified
+            target_body = doc.addObject("PartDesign::Body", label or f"{src.Label}_Clone_Body")
+
+        clone = target_body.newObject("PartDesign::FeatureBase", label or f"{src.Label}_Clone")
+        clone.BaseFeature = src
+
+        if translate_x or translate_y or translate_z or rotate_angle:
+            clone.Placement = _apply_relative_placement(
+                clone.Placement, translate_x, translate_y, translate_z,
+                rotate_axis_x, rotate_axis_y, rotate_axis_z, rotate_angle)
+
+        doc.recompute()
+
+        state = list(getattr(clone, "State", []) or [])
+        if any(s in ("Invalid", "Error") for s in state):
+            return ToolResult(success=False, output="",
+                              error=f"Clone '{clone.Label}' did not recompute cleanly.")
+
+        return ToolResult(
+            success=True,
+            output=f"Created PartDesign Clone '{clone.Label}' linked to '{src.Label}' in Body '{target_body.Label}'",
+            data={"name": clone.Name, "label": clone.Label, "body": target_body.Name},
+        )
+
+    return _with_undo("Create Clone", do)
+
+
+CREATE_CLONE = ToolDefinition(
+    name="create_clone",
+    description=(
+        "Create a live parametric PartDesign Clone (PartDesign::FeatureBase). "
+        "Unlike duplicate_object (which creates an independent detached copy), "
+        "a Clone stays parametrically linked to the source body/feature — modifying "
+        "the source geometry automatically updates all its clones. "
+        "Optional translate/rotate offset the clone placement relative to origin."
+    ),
+    category="modeling",
+    parameters=[
+        ToolParam("source_object", "string", "Internal name of the source body/object to clone"),
+        ToolParam("body_name", "string", "Target PartDesign Body (if omitted, creates a new Body for the clone)", required=False, default=""),
+        ToolParam("translate_x", "number", "X offset in mm", required=False, default=0.0),
+        ToolParam("translate_y", "number", "Y offset in mm", required=False, default=0.0),
+        ToolParam("translate_z", "number", "Z offset in mm", required=False, default=0.0),
+        ToolParam("rotate_axis_x", "number", "Rotation axis X component", required=False, default=0.0),
+        ToolParam("rotate_axis_y", "number", "Rotation axis Y component", required=False, default=0.0),
+        ToolParam("rotate_axis_z", "number", "Rotation axis Z component", required=False, default=1.0),
+        ToolParam("rotate_angle", "number", "Rotation angle in degrees", required=False, default=0.0),
+        ToolParam("label", "string", "Display label for the clone", required=False, default=""),
+    ],
+    handler=_handle_create_clone,
+)
+
+
+
+# ── create_subshape_binder ─────────────────────────────────
+
+def _handle_create_subshape_binder(
+    support_object: str,
+    body_name: str = "",
+    sub_elements: list | None = None,
+    label: str = "",
+) -> ToolResult:
+    """Create a PartDesign SubShapeBinder to reference external geometry into a Body."""
+    def do(doc):
+        sup = _get_object(doc, support_object)
+        if not sup:
+            hint = _suggest_similar(doc, support_object)
+            return ToolResult(success=False, output="", error=f"Support object '{support_object}' not found.{hint}")
+
+        body = None
+        if body_name:
+            body = _get_object(doc, body_name)
+            if not body:
+                hint = _suggest_similar(doc, body_name, "Body")
+                return ToolResult(success=False, output="", error=f"Body '{body_name}' not found.{hint}")
+        else:
+            # Find active or first PartDesign body
+            for o in doc.Objects:
+                if getattr(o, "TypeId", "") == "PartDesign::Body" and o != sup:
+                    body = o
+                    break
+            if not body:
+                body = doc.addObject("PartDesign::Body", "Body")
+
+        binder = body.newObject("PartDesign::SubShapeBinder", label or f"{sup.Label}_Binder")
+        elements = [str(e) for e in sub_elements] if sub_elements else [""]
+        binder.Support = [(sup, elements)]
+
+        doc.recompute()
+
+        state = list(getattr(binder, "State", []) or [])
+        if any(s in ("Invalid", "Error") for s in state):
+            return ToolResult(success=False, output="",
+                              error=f"SubShapeBinder '{binder.Label}' did not recompute cleanly.")
+
+        return ToolResult(
+            success=True,
+            output=f"Created SubShapeBinder '{binder.Label}' referencing '{sup.Label}' in Body '{body.Label}'",
+            data={"name": binder.Name, "label": binder.Label, "body": body.Name},
+        )
+
+    return _with_undo("Create SubShapeBinder", do)
+
+
+CREATE_SUBSHAPE_BINDER = ToolDefinition(
+    name="create_subshape_binder",
+    description=(
+        "Create a PartDesign SubShapeBinder (PartDesign::SubShapeBinder). "
+        "Allows a PartDesign Body to reference geometry (faces, edges, vertices, or entire shapes) "
+        "from another external Body or Part object without breaking PartDesign scope rules or "
+        "creating cyclic dependencies. Useful for modular assemblies, parting surfaces, and clearance pockets."
+    ),
+    category="modeling",
+    parameters=[
+        ToolParam("support_object", "string", "Internal name of the external object to reference"),
+        ToolParam("body_name", "string", "Target PartDesign Body to house the binder (if omitted, uses the active or first available Body)", required=False, default=""),
+        ToolParam("sub_elements", "array", "Specific sub-elements to bind (e.g. ['Face1', 'Edge3']). If omitted, binds the entire object.", required=False, items={"type": "string"}),
+        ToolParam("label", "string", "Display label for the binder", required=False, default=""),
+    ],
+    handler=_handle_create_subshape_binder,
+)
 
 # ── fillet_edges ────────────────────────────────────────────
 
@@ -3074,25 +3473,13 @@ LIST_DOCUMENTS = ToolDefinition(
 
 def _handle_switch_document(document_name: str) -> ToolResult:
     """Switch the active document."""
-    import FreeCAD as App
-    from ..core.active_document import sync_app_active_document, refresh_gui_for_document
+    from ..core.active_document import resolve_document_by_name, get_synced_active_document
 
-    docs = App.listDocuments()
-    doc = docs.get(document_name)
-    if not doc:
-        # Try matching by label
-        for d in docs.values():
-            if d.Label == document_name:
-                doc = d
-                break
-    if not doc:
-        available = ", ".join(docs.keys())
-        return ToolResult(success=False, output="",
-                          error=f"Document '{document_name}' not found. Available: {available}")
+    err = resolve_document_by_name(document_name)
+    if err:
+        return ToolResult(success=False, output="", error=err)
 
-    sync_app_active_document(doc)
-    refresh_gui_for_document(doc)
-
+    doc = get_synced_active_document()
     return ToolResult(
         success=True,
         output=f"Switched to document '{doc.Name}' ({len(doc.Objects)} objects).",
@@ -3421,6 +3808,41 @@ def _resolve_relative_value(current, expr: str):
     return expr
 
 
+def _coerce_property_value(current, resolved):
+    """Coerce ``resolved`` to match ``current``'s Python type when it's a
+    string carrying a numeric/boolean literal.
+
+    ``value`` arrives as a string over the wire (the tool's JSON schema
+    declares it ``"string"`` so relative expressions like ``"+10%"`` fit the
+    same slot as absolute values), and ``_resolve_relative_value`` passes an
+    absolute value straight through unchanged. Without this, ``setattr()``
+    on an ``App::PropertyInteger`` (or Float/Bool) raises
+    ``TypeError: type must be int, not str`` — FreeCAD's Python property
+    setters do not coerce strings themselves.
+    """
+    if not isinstance(resolved, str):
+        return resolved
+    text = resolved.strip()
+    if isinstance(current, bool):
+        low = text.lower()
+        if low in ("true", "1", "yes", "on"):
+            return True
+        if low in ("false", "0", "no", "off"):
+            return False
+        return resolved
+    if isinstance(current, int):
+        try:
+            return int(float(text))
+        except ValueError:
+            return resolved
+    if isinstance(current, float):
+        try:
+            return float(text)
+        except ValueError:
+            return resolved
+    return resolved
+
+
 def _handle_modify_property(
     object_name: str,
     property_name: str,
@@ -3440,7 +3862,7 @@ def _handle_modify_property(
             )
 
         current = getattr(obj, property_name)
-        resolved = _resolve_relative_value(current, value)
+        resolved = _coerce_property_value(current, _resolve_relative_value(current, value))
 
         # Report old→new for relative changes
         if resolved != value:
@@ -5703,8 +6125,11 @@ ALL_TOOLS = [
     LOFT_SKETCHES,
     SWEEP_SKETCH,
     BOOLEAN_OPERATION,
+    PART_JOIN_OPERATION,
     TRANSFORM_OBJECT,
     DUPLICATE_OBJECT,
+    CREATE_CLONE,
+    CREATE_SUBSHAPE_BINDER,
     FILLET_EDGES,
     CHAMFER_EDGES,
     CREATE_INNER_RIDGE,

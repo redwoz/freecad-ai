@@ -10,11 +10,27 @@ Decided behaviour: halt the loop on truncation (do NOT execute that turn's tool
 calls), warn the user, and let the truncated turn count against max_tool_turns.
 """
 
+import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from freecad_ai.core.loop_control import resolve_turn_outcome, should_continue_loop
 from freecad_ai.llm.client import LLMClient, LLMStreamEvent, ToolCall
+
+
+def _has_qt_bindings():
+    """True if either PySide6 or PySide2 is importable (matches
+    ``freecad_ai/ui/compat.py``'s own fallback order)."""
+    try:
+        import PySide6  # noqa: F401
+        return True
+    except ImportError:
+        pass
+    try:
+        import PySide2  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
 
 class TestResolveTurnOutcome:
@@ -209,6 +225,8 @@ class TestToolLoopHaltsOnTruncation:
     ]
 
     def _run(self, truncated, events=None):
+        if not _has_qt_bindings():
+            pytest.skip("PySide6/PySide2 not available")
         from freecad_ai.ui.chat_widget import _LLMWorker
         worker = _fake_worker()
         client = _FakeClient(events or self._TOOL_TURN, truncated)
