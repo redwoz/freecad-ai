@@ -2125,6 +2125,104 @@ BOOLEAN_OPERATION = ToolDefinition(
 )
 
 
+# ── part_join_operation ─────────────────────────────────────
+
+def _handle_part_join_operation(
+    operation: str,
+    base_object: str,
+    tool_objects: list | None = None,
+    label: str = "",
+) -> ToolResult:
+    """Perform an advanced OpenCASCADE BOP join operation (Connect, Slice, Embed)."""
+    def do(doc):
+        base = _get_object(doc, base_object)
+        if not base:
+            hint = _suggest_similar(doc, base_object)
+            return ToolResult(success=False, output="", error=f"Base object '{base_object}' not found.{hint}")
+
+        tools = []
+        if tool_objects:
+            for t_name in tool_objects:
+                t_obj = _get_object(doc, str(t_name))
+                if not t_obj:
+                    hint = _suggest_similar(doc, str(t_name))
+                    return ToolResult(success=False, output="", error=f"Tool object '{t_name}' not found.{hint}")
+                tools.append(t_obj)
+
+        op = operation.lower()
+        if op not in ("connect", "slice", "embed"):
+            return ToolResult(
+                success=False, output="",
+                error=f"Unknown join operation: {operation}. Use: connect, slice, embed",
+            )
+
+        try:
+            import BOPTools.JoinFeatures
+            import BOPTools.SplitFeatures
+        except ImportError:
+            return ToolResult(success=False, output="", error="BOPTools module not available in FreeCAD environment.")
+
+        name = label or f"{operation.capitalize()}_{base.Label}"
+        result_obj = None
+
+        if op == "connect":
+            # Connect: joins intersecting objects without internal walls
+            all_objs = [base] + tools
+            result_obj = BOPTools.JoinFeatures.makeConnect(name=name)
+            result_obj.Objects = all_objs
+        elif op == "slice":
+            # Slice: splits base object using tool sheets/solids
+            if not tools:
+                return ToolResult(success=False, output="", error="Slice operation requires at least one tool object in 'tool_objects'.")
+            result_obj = BOPTools.SplitFeatures.makeSlice(name=name)
+            result_obj.Base = base
+            result_obj.Tools = tools
+            result_obj.Mode = "Split"
+        elif op == "embed":
+            # Embed: embeds tool solid into base solid
+            if not tools:
+                return ToolResult(success=False, output="", error="Embed operation requires exactly one tool object in 'tool_objects'.")
+            result_obj = BOPTools.JoinFeatures.makeEmbed(name=name)
+            result_obj.Base = base
+            result_obj.Tool = tools[0]
+
+        doc.recompute()
+
+        state = list(getattr(result_obj, "State", []) or [])
+        if any(s in ("Invalid", "Error") for s in state):
+            return ToolResult(success=False, output="",
+                              error=f"Part join operation '{operation}' did not recompute cleanly.")
+
+        return ToolResult(
+            success=True,
+            output=f"Performed Part join '{operation}' creating '{result_obj.Label}' ({result_obj.TypeId})",
+            data={"name": result_obj.Name, "label": result_obj.Label, "type_id": result_obj.TypeId},
+        )
+
+    return _with_undo(f"Part Join {operation}", do)
+
+
+PART_JOIN_OPERATION = ToolDefinition(
+    name="part_join_operation",
+    description=(
+        "Advanced OpenCASCADE Part Join and Split operations (Connect, Slice, Embed). "
+        "• 'connect': joins intersecting solids/shells into a single connected volume, removing internal intersecting walls (unlike fuse which can leave inner voids). "
+        "• 'slice': cuts a base solid with tool surfaces/sheets into partitioned solid components. "
+        "• 'embed': embeds a tool solid into a base solid, maintaining boundary surfaces. "
+        "Note: These operate on Part level geometry. For pure parametric PartDesign models, prefer standard subtractive/additive features."
+    ),
+    category="modeling",
+    parameters=[
+        ToolParam("operation", "string", "Join operation type", enum=["connect", "slice", "embed"]),
+        ToolParam("base_object", "string", "Internal name of the base object (or first object for connect)"),
+        ToolParam("tool_objects", "array", "Internal names of tool objects (cutting tools for slice, embedded tool for embed, additional objects for connect)",
+                  required=False, items={"type": "string"}),
+        ToolParam("label", "string", "Display label for the result", required=False, default=""),
+    ],
+    handler=_handle_part_join_operation,
+)
+
+
 # ── transform_object ────────────────────────────────────────
 
 def _apply_relative_placement(old, tx, ty, tz, ax, ay, az, angle):
@@ -5776,6 +5874,7 @@ ALL_TOOLS = [
     LOFT_SKETCHES,
     SWEEP_SKETCH,
     BOOLEAN_OPERATION,
+    PART_JOIN_OPERATION,
     TRANSFORM_OBJECT,
     DUPLICATE_OBJECT,
     FILLET_EDGES,

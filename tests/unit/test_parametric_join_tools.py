@@ -3,6 +3,7 @@
 import pytest
 from freecad_ai.tools.freecad_tools import (
     ALL_TOOLS,
+    PART_JOIN_OPERATION,
     SWEEP_SKETCH,
     CREATE_SKETCH,
     EDIT_SKETCH,
@@ -16,3 +17,14 @@ class TestNewToolsDefinitions:
         assert set(params["transition"].enum) == {"Transformed", "RightCorner", "RoundCorner"}
         assert "frenet" in params
         assert params["frenet"].type == "boolean"
+
+    def test_part_join_operation_params(self):
+        assert PART_JOIN_OPERATION.name == "part_join_operation"
+        assert PART_JOIN_OPERATION.category == "modeling"
+        params = {p.name: p for p in PART_JOIN_OPERATION.parameters}
+        assert "operation" in params
+        assert set(params["operation"].enum) == {"connect", "slice", "embed"}
+        assert "base_object" in params
+        assert "tool_objects" in params
+        assert params["tool_objects"].type == "array"
+        assert params["tool_objects"].items == {"type": "string"}
